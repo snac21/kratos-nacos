@@ -11,12 +11,12 @@ import (
 
 // ConfigSource 包装 Client 以实现 config.Source 接口
 type ConfigSource struct {
-	client *Client
+	Client *Client
 }
 
 // NewConfigSource 创建配置源
 func NewConfigSource(client *Client) *ConfigSource {
-	return &ConfigSource{client: client}
+	return &ConfigSource{Client: client}
 }
 
 // 确保 ConfigSource 实现了 Kratos 接口
@@ -24,14 +24,14 @@ var _ config.Source = (*ConfigSource)(nil)
 
 // Load 加载配置
 func (cs *ConfigSource) Load() ([]*config.KeyValue, error) {
-	if cs.client.opts.ConfigDataID == "" {
+	if cs.Client.opts.ConfigDataID == "" {
 		return nil, fmt.Errorf("nacos config DataID is required")
 	}
 
 	// 1. 从 Nacos 获取配置内容
-	content, err := cs.client.configClient.GetConfig(vo.ConfigParam{
-		DataId: cs.client.opts.ConfigDataID,
-		Group:  cs.client.opts.ConfigGroup,
+	content, err := cs.Client.ConfigClient.GetConfig(vo.ConfigParam{
+		DataId: cs.Client.opts.ConfigDataID,
+		Group:  cs.Client.opts.ConfigGroup,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get config from nacos: %w", err)
@@ -42,7 +42,7 @@ func (cs *ConfigSource) Load() ([]*config.KeyValue, error) {
 	// Key 可以 DataID，Value 是文件内容
 	// Kratos 的 Config 组件会用 YAML 解码器 (codec) 来解析这个 Value。
 	kv := &config.KeyValue{
-		Key:    cs.client.opts.ConfigDataID,
+		Key:    cs.Client.opts.ConfigDataID,
 		Value:  []byte(content),
 		Format: "yaml", // 明确指定格式为 yaml
 	}
@@ -53,7 +53,7 @@ func (cs *ConfigSource) Load() ([]*config.KeyValue, error) {
 func (cs *ConfigSource) Watch() (config.Watcher, error) {
 	// Nacos SDK 提供了 ListenConfig 方法，
 	// 同样需要一个适配器将其转换为 Kratos 的 Watcher (channel)
-	watcher, err := newNacosConfigWatcher(cs.client, cs.client.opts.ConfigDataID, cs.client.opts.ConfigGroup)
+	watcher, err := newNacosConfigWatcher(cs.Client, cs.Client.opts.ConfigDataID, cs.Client.opts.ConfigGroup)
 	if err != nil {
 		return nil, err
 	}
@@ -86,7 +86,7 @@ func newNacosConfigWatcher(c *Client, dataID, group string) (config.Watcher, err
 	}
 
 	// 启动 Nacos 监听
-	err := c.configClient.ListenConfig(vo.ConfigParam{
+	err := c.ConfigClient.ListenConfig(vo.ConfigParam{
 		DataId: dataID,
 		Group:  group,
 		OnChange: func(namespace, group, dataId, data string) {
@@ -133,7 +133,7 @@ func (w *nacosConfigWatcher) Stop() error {
 	w.cancel() // 触发 Next() 中的 context.Canceled
 
 	// 停止 Nacos 监听
-	return w.client.configClient.CancelListenConfig(vo.ConfigParam{
+	return w.client.ConfigClient.CancelListenConfig(vo.ConfigParam{
 		DataId: w.dataID,
 		Group:  w.group,
 	})

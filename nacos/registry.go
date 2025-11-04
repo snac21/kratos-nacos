@@ -93,7 +93,7 @@ func (c *Client) Register(ctx context.Context, service *registry.ServiceInstance
 		}
 
 		// 4. 调用 Nacos SDK 注册
-		_, err = c.namingClient.RegisterInstance(params)
+		_, err = c.NamingClient.RegisterInstance(params)
 		if err != nil {
 			// 注册失败不应阻塞其他 endpoint 注册，但需要返回错误
 			log.Errorf("[kratos-nacos] Failed to register instance to nacos: %v. Params: %+v", err, params)
@@ -139,7 +139,7 @@ func (c *Client) Deregister(ctx context.Context, service *registry.ServiceInstan
 			Ephemeral:   c.opts.Ephemeral,
 		}
 
-		_, err = c.namingClient.DeregisterInstance(params)
+		_, err = c.NamingClient.DeregisterInstance(params)
 		if err != nil {
 			log.Errorf("[kratos-nacos] Failed to deregister instance from nacos: %v. Params: %+v", err, params)
 			// 即使一个失败了，也应尝试注销其他的
@@ -173,7 +173,7 @@ func (c *Client) GetService(ctx context.Context, serviceName string) ([]*registr
 			HealthyOnly: true, // 只返回健康实例
 		}
 
-		instances, err := c.namingClient.SelectInstances(params)
+		instances, err := c.NamingClient.SelectInstances(params)
 		if err != nil {
 			// 记录最后一个错误，但不中断查询
 			lastErr = err
@@ -310,7 +310,7 @@ func newNacosWatcher(ctx context.Context, c *Client, serviceName string, groupNa
 	for _, protocol := range protocolsToWatch {
 		nacosServiceName := fmt.Sprintf("%s.%s", serviceName, protocol)
 
-		err := watcher.client.namingClient.Subscribe(&vo.SubscribeParam{
+		err := watcher.client.NamingClient.Subscribe(&vo.SubscribeParam{
 			ServiceName: nacosServiceName,
 			GroupName:   groupName,
 			Clusters:    clusters,
@@ -388,7 +388,7 @@ func (w *NacosWatcher) Stop() error {
 	for _, protocol := range protocolsToWatch {
 		nacosServiceName := fmt.Sprintf("%s.%s", w.kratosSvcName, protocol)
 
-		err := w.client.namingClient.Unsubscribe(&vo.SubscribeParam{
+		err := w.client.NamingClient.Unsubscribe(&vo.SubscribeParam{
 			ServiceName: nacosServiceName,
 			GroupName:   w.groupName,
 			Clusters:    w.clusters,
