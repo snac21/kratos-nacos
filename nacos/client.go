@@ -2,6 +2,7 @@ package nacos
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/nacos-group/nacos-sdk-go/v2/clients"
 	"github.com/nacos-group/nacos-sdk-go/v2/clients/config_client"
@@ -14,6 +15,8 @@ type Client struct {
 	opts         *Options
 	NamingClient naming_client.INamingClient
 	ConfigClient config_client.IConfigClient
+	mu           sync.Mutex
+	activeWatch  map[string]*sharedSubscription
 }
 
 // NewClient 创建一个新的 Nacos 客户端实例
@@ -58,5 +61,6 @@ func NewClient(opts ...Option) (*Client, error) {
 		opts:         o,
 		NamingClient: namingClient,
 		ConfigClient: configClient,
+		activeWatch:  make(map[string]*sharedSubscription),
 	}, nil
 }

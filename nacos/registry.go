@@ -2,6 +2,7 @@ package nacos
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -271,26 +272,33 @@ func (c *Client) getSupportedProtocols() []string {
 	return []string{protocolHTTP, protocolGRPC}
 }
 
-// NacosWatcher 实现了 Kratos 的 registry.Watcher
+type sharedSubscription struct {
+	mu            sync.Mutex
+	kratosSvcName string
+	groupName     string
+	clusters      []string
+	refCount      int
+	listeners     map[*NacosWatcher]chan []*registry.ServiceInstance
+	instances     []*registry.ServiceInstance
+	serviceStore  map[string][]*registry.ServiceInstance
+	// subscribeParams 保存 Nacos SDK 注册时使用的原始回调。
+	// SDK 注销时必须传入同一个回调，不能重新构造空回调。
+	subscribeParams map[string]*vo.SubscribeParam
+}
+
+// NacosWatcher 逻辑观察者
 type NacosWatcher struct {
 	ctx           context.Context
 	cancel        context.CancelFunc
 	client        *Client
-	kratosSvcName string // e.g., "serviceName"
-	groupName     string
-	clusters      []string
-
-	// Watcher 需要一个 channel 来推送结果
-	// Kratos Client (gRPC/HTTP) 会从这个 channel 接收更新
-	eventChan chan []*registry.ServiceInstance
-
-	// 要 Watch 多个 Nacos 服务 (http/grpc)，
-	// 需要一个内部状态来合并结果
-	mu           sync.RWMutex                           // 保护 serviceStore 的并发访问
-	serviceStore map[string][]*registry.ServiceInstance // key: nacosServiceName
+	kratosSvcName string
+	eventChan     chan []*registry.ServiceInstance
+	sub           *sharedSubscription
+	stopOnce      sync.Once
+	stopErr       error
 }
 
-// newNacosWatcher 创建一个新的 Watcher
+// newNacosWatcher 创建并返回一个 Nacos 逻辑观察者
 func newNacosWatcher(ctx context.Context, c *Client, serviceName string, groupName string, clusters ...string) (registry.Watcher, error) {
 	wCtx, wCancel := context.WithCancel(ctx)
 
@@ -299,71 +307,120 @@ func newNacosWatcher(ctx context.Context, c *Client, serviceName string, groupNa
 		cancel:        wCancel,
 		client:        c,
 		kratosSvcName: serviceName,
-		groupName:     groupName,
-		clusters:      clusters,
-		eventChan:     make(chan []*registry.ServiceInstance, watcherBufferSize), // 缓冲 channel
-		serviceStore:  make(map[string][]*registry.ServiceInstance, 2),           // 预分配 http/grpc 两个协议
+		eventChan:     make(chan []*registry.ServiceInstance, watcherBufferSize),
 	}
 
-	// 启动 Nacos Subscribe
-	protocolsToWatch := c.getSupportedProtocols()
-	for _, protocol := range protocolsToWatch {
-		nacosServiceName := fmt.Sprintf("%s.%s", serviceName, protocol)
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-		err := watcher.client.NamingClient.Subscribe(&vo.SubscribeParam{
-			ServiceName: nacosServiceName,
-			GroupName:   groupName,
-			Clusters:    clusters,
-			// Nacos 回调函数
-			SubscribeCallback: func(services []model.Instance, err error) {
-				if err != nil {
-					log.Errorf("[kratos-nacos-watcher] Nacos subscribe callback error: %v (Service: %s)", err, nacosServiceName)
-					return
-				}
+	sub, ok := c.activeWatch[serviceName]
+	if !ok {
+		sub = &sharedSubscription{
+			kratosSvcName:   serviceName,
+			groupName:       groupName,
+			clusters:        clusters,
+			listeners:       make(map[*NacosWatcher]chan []*registry.ServiceInstance),
+			serviceStore:    make(map[string][]*registry.ServiceInstance, 2),
+			subscribeParams: make(map[string]*vo.SubscribeParam, 2),
+		}
+		c.activeWatch[serviceName] = sub
 
-				// Nacos 推送了更新
-				log.Debugf("[kratos-nacos-watcher] Received update for %s: %d instances", nacosServiceName, len(services))
+		// 创建真实的 Nacos 物理订阅。至少一个协议订阅成功，Watcher 才能返回。
+		// 否则 Kratos resolver 会被误判为已创建成功，但永远收不到地址更新。
+		var subscribeErrs []error
+		protocolsToWatch := c.getSupportedProtocols()
+		for _, protocol := range protocolsToWatch {
+			nacosServiceName := fmt.Sprintf("%s.%s", serviceName, protocol)
 
-				// 1. 转换 Nacos 实例为 Kratos 实例
-				kratosInstances := c.nacosInstancesToKratos(services, watcher.kratosSvcName)
+			param := &vo.SubscribeParam{
+				ServiceName: nacosServiceName,
+				GroupName:   groupName,
+				Clusters:    clusters,
+				SubscribeCallback: func(services []model.Instance, err error) {
+					if err != nil {
+						log.Errorf("[kratos-nacos-watcher] Nacos subscribe callback error: %v (Service: %s)", err, nacosServiceName)
+						return
+					}
+					ips := make([]string, 0, len(services))
+					for _, s := range services {
+						ips = append(ips, fmt.Sprintf("%s:%d", s.Ip, s.Port))
+					}
+					log.Debugf("[kratos-nacos-watcher] Received update for %s: %d instances [%s]", nacosServiceName, len(services), strings.Join(ips, ","))
+					kratosInstances := c.nacosInstancesToKratos(services, serviceName)
+					sub.updateAndMerge(nacosServiceName, kratosInstances)
+				},
+			}
+			err := c.NamingClient.Subscribe(param)
+			if err != nil {
+				log.Errorf("[kratos-nacos-watcher] Failed to subscribe nacos service: %s. Error: %v", nacosServiceName, err)
+				subscribeErrs = append(subscribeErrs, fmt.Errorf("subscribe %s: %w", nacosServiceName, err))
+				continue
+			}
+			sub.subscribeParams[nacosServiceName] = param
+		}
 
-				// 2. 更新内部状态并合并
-				allInstances := watcher.updateAndMerge(nacosServiceName, kratosInstances)
+		if len(sub.subscribeParams) == 0 {
+			delete(c.activeWatch, serviceName)
+			wCancel()
+			return nil, fmt.Errorf("failed to subscribe nacos service %q: %w", serviceName, errors.Join(subscribeErrs...))
+		}
 
-				// 3. 推送到 Kratos channel
-				// (非阻塞发送，防止 Kratos Client 卡住导致 Nacos 回调阻塞)
-				select {
-				case watcher.eventChan <- allInstances:
-				default:
-					log.Warnf("[kratos-nacos-watcher] Event channel is full, discarding update for %s", watcher.kratosSvcName)
-				}
-			},
-		})
-
-		if err != nil {
-			log.Errorf("[kratos-nacos-watcher] Failed to subscribe nacos service: %s. Error: %v", nacosServiceName, err)
-			// 如果订阅 http 失败，不应阻止订阅 grpc。
-			// 但如果两个都失败，Next() 将永远阻塞。
+		// 订阅成功后立即同步拉取一次实例，避免 resolver 重建后只能被动等待
+		// Nacos 的下一次推送，从而长时间没有可用地址。
+		for nacosServiceName := range sub.subscribeParams {
+			instances, err := c.NamingClient.SelectInstances(vo.SelectInstancesParam{
+				ServiceName: nacosServiceName,
+				GroupName:   groupName,
+				Clusters:    clusters,
+				HealthyOnly: true,
+			})
+			if err != nil {
+				log.Warnf("[kratos-nacos-watcher] Failed to fetch initial instances: %s. Error: %v", nacosServiceName, err)
+				continue
+			}
+			sub.updateAndMerge(nacosServiceName, c.nacosInstancesToKratos(instances, serviceName))
 		}
 	}
 
+	sub.mu.Lock()
+	sub.refCount++
+	sub.listeners[watcher] = watcher.eventChan
+	// 如果已存在缓存节点快照，立刻非阻塞推送给该客户端通道，以秒级唤醒，避免等待重连超时
+	if len(sub.instances) > 0 {
+		select {
+		case watcher.eventChan <- sub.instances:
+		default:
+		}
+	}
+	sub.mu.Unlock()
+
+	watcher.sub = sub
 	return watcher, nil
 }
 
 // updateAndMerge 更新服务存储并合并所有协议的实例
 // Nacos 的回调是并发的，需要加锁保护 serviceStore
-func (w *NacosWatcher) updateAndMerge(nacosServiceName string, instances []*registry.ServiceInstance) []*registry.ServiceInstance {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+func (s *sharedSubscription) updateAndMerge(nacosServiceName string, instances []*registry.ServiceInstance) []*registry.ServiceInstance {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	// 更新指定协议的服务实例
-	w.serviceStore[nacosServiceName] = instances
+	s.serviceStore[nacosServiceName] = instances
 
-	// 合并所有协议 (http + grpc) 的实例
 	mergedList := make([]*registry.ServiceInstance, 0)
-	for _, list := range w.serviceStore {
+	for _, list := range s.serviceStore {
 		mergedList = append(mergedList, list...)
 	}
+
+	s.instances = mergedList
+
+	for _, ch := range s.listeners {
+		select {
+		case ch <- mergedList:
+		default:
+			log.Warnf("[kratos-nacos-watcher] Event channel is full, discarding update for %s", s.kratosSvcName)
+		}
+	}
+
 	return mergedList
 }
 
@@ -377,37 +434,43 @@ func (w *NacosWatcher) Next() ([]*registry.ServiceInstance, error) {
 	}
 }
 
-// Stop 实现了 registry.Watcher 接口
+// Stop 实现了 registry.Watcher 接口 (逻辑监听退出)
 func (w *NacosWatcher) Stop() error {
-	// 先取消上下文，防止新的事件产生
-	w.cancel()
+	w.stopOnce.Do(func() {
+		w.cancel()
 
-	// 停止 Nacos 订阅
-	var lastErr error
-	protocolsToWatch := w.client.getSupportedProtocols()
-	for _, protocol := range protocolsToWatch {
-		nacosServiceName := fmt.Sprintf("%s.%s", w.kratosSvcName, protocol)
-
-		err := w.client.NamingClient.Unsubscribe(&vo.SubscribeParam{
-			ServiceName: nacosServiceName,
-			GroupName:   w.groupName,
-			Clusters:    w.clusters,
-		})
-		if err != nil {
-			lastErr = err
-			log.Errorf("[kratos-nacos-watcher] Failed to unsubscribe nacos service: %s. Error: %v", nacosServiceName, err)
-		} else {
-			log.Debugf("[kratos-nacos-watcher] Successfully unsubscribed from nacos service: %s", nacosServiceName)
+		sub := w.sub
+		if sub == nil {
+			return
 		}
-	}
 
-	// 清理资源
-	w.mu.Lock()
-	w.serviceStore = nil // 清空存储
-	w.mu.Unlock()
+		// 持有 client 锁直到物理注销完成，防止新的 Watch 已订阅后被旧 Watch 的
+		// Unsubscribe 反向取消。IDLE 重建会在该锁释放后创建干净的新订阅。
+		w.client.mu.Lock()
+		defer w.client.mu.Unlock()
 
-	// 关闭事件通道
-	close(w.eventChan)
+		sub.mu.Lock()
+		delete(sub.listeners, w)
+		sub.refCount--
+		if sub.refCount > 0 {
+			sub.mu.Unlock()
+			return
+		}
+		delete(w.client.activeWatch, w.kratosSvcName)
+		params := make([]*vo.SubscribeParam, 0, len(sub.subscribeParams))
+		for _, param := range sub.subscribeParams {
+			params = append(params, param)
+		}
+		sub.mu.Unlock()
 
-	return lastErr
+		for _, param := range params {
+			if err := w.client.NamingClient.Unsubscribe(param); err != nil {
+				w.stopErr = errors.Join(w.stopErr, fmt.Errorf("unsubscribe %s: %w", param.ServiceName, err))
+				log.Errorf("[kratos-nacos-watcher] Failed to unsubscribe nacos service: %s. Error: %v", param.ServiceName, err)
+				continue
+			}
+			log.Debugf("[kratos-nacos-watcher] Successfully unsubscribed from nacos service: %s", param.ServiceName)
+		}
+	})
+	return w.stopErr
 }
