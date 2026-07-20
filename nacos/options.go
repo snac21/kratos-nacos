@@ -2,6 +2,7 @@ package nacos
 
 import (
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 
@@ -10,6 +11,9 @@ import (
 
 // Options 封装了 Nacos 客户端和服务注册所需的配置
 type Options struct {
+	// 自定义 slog 日志记录器
+	Logger *slog.Logger
+
 	// Nacos 客户端配置
 	ClientConfig *constant.ClientConfig
 	// Nacos 服务端地址
@@ -143,11 +147,10 @@ func WithCacheDir(cacheDir string) Option {
 	}
 }
 
-// WithLogger 设置自定义日志器
-func WithLogger(logger interface{}) Option {
+// WithLogger 设置自定义 slog 日志记录器
+func WithLogger(logger *slog.Logger) Option {
 	return func(o *Options) {
-		// 这里可以设置自定义日志器，具体实现根据需要
-		// o.ClientConfig.CustomLogger = logger
+		o.Logger = logger
 	}
 }
 

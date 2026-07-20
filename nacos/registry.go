@@ -9,13 +9,15 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/go-kratos/kratos/v2/log"
-	"github.com/go-kratos/kratos/v2/registry"
+	"log/slog"
+
+	"github.com/go-kratos/kratos/v3/registry"
 	"github.com/nacos-group/nacos-sdk-go/v2/model"
 	"github.com/nacos-group/nacos-sdk-go/v2/vo"
 )
 
-// 确保 Client 实现了 Kratos 接口
+// 确保 slog 被保留及 Client 实现了 Kratos 接口
+var _ *slog.Logger
 var _ registry.Registrar = (*Client)(nil)
 var _ registry.Discovery = (*Client)(nil)
 
@@ -48,14 +50,14 @@ func (c *Client) Register(ctx context.Context, service *registry.ServiceInstance
 	for _, endpoint := range service.Endpoints {
 		u, err := url.Parse(endpoint)
 		if err != nil {
-			log.Errorf("[kratos-nacos] Failed to parse endpoint: %v. Endpoint: %s", err, endpoint)
+			c.Logger().Error(fmt.Sprintf("[kratos-nacos] Failed to parse endpoint: %v. Endpoint: %s", err, endpoint))
 			continue // 跳过这个错误的 endpoint
 		}
 
 		host := u.Hostname()
 		port, _ := strconv.ParseUint(u.Port(), 10, 64)
 		if port == 0 {
-			log.Warnf("[kratos-nacos] Endpoint missing port: %s", endpoint)
+			c.Logger().Warn(fmt.Sprintf("[kratos-nacos] Endpoint missing port: %s", endpoint))
 			continue
 		}
 
@@ -97,10 +99,10 @@ func (c *Client) Register(ctx context.Context, service *registry.ServiceInstance
 		_, err = c.NamingClient.RegisterInstance(params)
 		if err != nil {
 			// 注册失败不应阻塞其他 endpoint 注册，但需要返回错误
-			log.Errorf("[kratos-nacos] Failed to register instance to nacos: %v. Params: %+v", err, params)
+			c.Logger().Error(fmt.Sprintf("[kratos-nacos] Failed to register instance to nacos: %v. Params: %+v", err, params))
 			return fmt.Errorf("failed to register instance in nacos: %w", err)
 		}
-		log.Infof("[kratos-nacos] Service registered successfully: %s (%s:%d)", nacosServiceName, host, port)
+		c.Logger().Info(fmt.Sprintf("[kratos-nacos] Service registered successfully: %s (%s:%d)", nacosServiceName, host, port))
 	}
 
 	return nil
@@ -119,7 +121,7 @@ func (c *Client) Deregister(ctx context.Context, service *registry.ServiceInstan
 	for _, endpoint := range service.Endpoints {
 		u, err := url.Parse(endpoint)
 		if err != nil {
-			log.Errorf("[kratos-nacos] Failed to parse endpoint for deregister: %v. Endpoint: %s", err, endpoint)
+			c.Logger().Error(fmt.Sprintf("[kratos-nacos] Failed to parse endpoint for deregister: %v. Endpoint: %s", err, endpoint))
 			continue
 		}
 
@@ -142,10 +144,10 @@ func (c *Client) Deregister(ctx context.Context, service *registry.ServiceInstan
 
 		_, err = c.NamingClient.DeregisterInstance(params)
 		if err != nil {
-			log.Errorf("[kratos-nacos] Failed to deregister instance from nacos: %v. Params: %+v", err, params)
+			c.Logger().Error(fmt.Sprintf("[kratos-nacos] Failed to deregister instance from nacos: %v. Params: %+v", err, params))
 			// 即使一个失败了，也应尝试注销其他的
 		} else {
-			log.Infof("[kratos-nacos] Service deregistered successfully: %s (%s:%d)", nacosServiceName, host, port)
+			c.Logger().Info(fmt.Sprintf("[kratos-nacos] Service deregistered successfully: %s (%s:%d)", nacosServiceName, host, port))
 		}
 	}
 
@@ -178,7 +180,7 @@ func (c *Client) GetService(ctx context.Context, serviceName string) ([]*registr
 		if err != nil {
 			// 记录最后一个错误，但不中断查询
 			lastErr = err
-			log.Warnf("[kratos-nacos] Failed to get service from nacos: %s. Error: %v", nacosServiceName, err)
+			c.Logger().Warn(fmt.Sprintf("[kratos-nacos] Failed to get service from nacos: %s. Error: %v", nacosServiceName, err))
 			continue
 		}
 
@@ -189,7 +191,7 @@ func (c *Client) GetService(ctx context.Context, serviceName string) ([]*registr
 
 	if len(allInstances) == 0 {
 		// 如果 http 和 grpc 都没查到，记录警告但返回空列表
-		log.Warnf("[kratos-nacos] No healthy instances found for service: %s (checked .http and .grpc)", serviceName)
+		c.Logger().Warn(fmt.Sprintf("[kratos-nacos] No healthy instances found for service: %s (checked .http and .grpc)", serviceName))
 		// 如果有错误且没有找到任何实例，可以考虑返回错误
 		if lastErr != nil {
 			return nil, fmt.Errorf("failed to discover service %s: %w", serviceName, lastErr)
@@ -274,6 +276,7 @@ func (c *Client) getSupportedProtocols() []string {
 
 type sharedSubscription struct {
 	mu            sync.Mutex
+	client        *Client
 	kratosSvcName string
 	groupName     string
 	clusters      []string
@@ -316,6 +319,7 @@ func newNacosWatcher(ctx context.Context, c *Client, serviceName string, groupNa
 	sub, ok := c.activeWatch[serviceName]
 	if !ok {
 		sub = &sharedSubscription{
+			client:          c,
 			kratosSvcName:   serviceName,
 			groupName:       groupName,
 			clusters:        clusters,
@@ -338,21 +342,21 @@ func newNacosWatcher(ctx context.Context, c *Client, serviceName string, groupNa
 				Clusters:    clusters,
 				SubscribeCallback: func(services []model.Instance, err error) {
 					if err != nil {
-						log.Errorf("[kratos-nacos-watcher] Nacos subscribe callback error: %v (Service: %s)", err, nacosServiceName)
+						c.Logger().Error(fmt.Sprintf("[kratos-nacos-watcher] Nacos subscribe callback error: %v (Service: %s)", err, nacosServiceName))
 						return
 					}
 					ips := make([]string, 0, len(services))
 					for _, s := range services {
 						ips = append(ips, fmt.Sprintf("%s:%d", s.Ip, s.Port))
 					}
-					log.Debugf("[kratos-nacos-watcher] Received update for %s: %d instances [%s]", nacosServiceName, len(services), strings.Join(ips, ","))
+					c.Logger().Debug(fmt.Sprintf("[kratos-nacos-watcher] Received update for %s: %d instances [%s]", nacosServiceName, len(services)), strings.Join(ips, ","))
 					kratosInstances := c.nacosInstancesToKratos(services, serviceName)
 					sub.updateAndMerge(nacosServiceName, kratosInstances)
 				},
 			}
 			err := c.NamingClient.Subscribe(param)
 			if err != nil {
-				log.Errorf("[kratos-nacos-watcher] Failed to subscribe nacos service: %s. Error: %v", nacosServiceName, err)
+				c.Logger().Error(fmt.Sprintf("[kratos-nacos-watcher] Failed to subscribe nacos service: %s. Error: %v", nacosServiceName, err))
 				subscribeErrs = append(subscribeErrs, fmt.Errorf("subscribe %s: %w", nacosServiceName, err))
 				continue
 			}
@@ -375,7 +379,7 @@ func newNacosWatcher(ctx context.Context, c *Client, serviceName string, groupNa
 				HealthyOnly: true,
 			})
 			if err != nil {
-				log.Warnf("[kratos-nacos-watcher] Failed to fetch initial instances: %s. Error: %v", nacosServiceName, err)
+				c.Logger().Warn(fmt.Sprintf("[kratos-nacos-watcher] Failed to fetch initial instances: %s. Error: %v", nacosServiceName, err))
 				continue
 			}
 			sub.updateAndMerge(nacosServiceName, c.nacosInstancesToKratos(instances, serviceName))
@@ -417,7 +421,9 @@ func (s *sharedSubscription) updateAndMerge(nacosServiceName string, instances [
 		select {
 		case ch <- mergedList:
 		default:
-			log.Warnf("[kratos-nacos-watcher] Event channel is full, discarding update for %s", s.kratosSvcName)
+			if s.client != nil {
+				s.client.Logger().Warn(fmt.Sprintf("[kratos-nacos-watcher] Event channel is full, discarding update for %s", s.kratosSvcName))
+			}
 		}
 	}
 
@@ -466,10 +472,10 @@ func (w *NacosWatcher) Stop() error {
 		for _, param := range params {
 			if err := w.client.NamingClient.Unsubscribe(param); err != nil {
 				w.stopErr = errors.Join(w.stopErr, fmt.Errorf("unsubscribe %s: %w", param.ServiceName, err))
-				log.Errorf("[kratos-nacos-watcher] Failed to unsubscribe nacos service: %s. Error: %v", param.ServiceName, err)
+				w.client.Logger().Error(fmt.Sprintf("[kratos-nacos-watcher] Failed to unsubscribe nacos service: %s. Error: %v", param.ServiceName, err))
 				continue
 			}
-			log.Debugf("[kratos-nacos-watcher] Successfully unsubscribed from nacos service: %s", param.ServiceName)
+			w.client.Logger().Debug(fmt.Sprintf("[kratos-nacos-watcher] Successfully unsubscribed from nacos service: %s", param.ServiceName))
 		}
 	})
 	return w.stopErr

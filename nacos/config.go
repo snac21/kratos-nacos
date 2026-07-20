@@ -3,9 +3,8 @@ package nacos
 import (
 	"context"
 	"fmt"
-	"log"
 
-	"github.com/go-kratos/kratos/v2/config"
+	"github.com/go-kratos/kratos/v3/config"
 	"github.com/nacos-group/nacos-sdk-go/v2/vo"
 )
 
@@ -91,7 +90,7 @@ func newNacosConfigWatcher(c *Client, dataID, group string) (config.Watcher, err
 		Group:  group,
 		OnChange: func(namespace, group, dataId, data string) {
 			// 配置发生变更时的回调
-			log.Printf("[kratos-nacos] Config changed: %s", dataId)
+			c.Logger().Info(fmt.Sprintf("[kratos-nacos] Config changed: %s", dataId))
 			kv := &config.KeyValue{
 				Key:    dataId,
 				Value:  []byte(data),
@@ -103,7 +102,7 @@ func newNacosConfigWatcher(c *Client, dataID, group string) (config.Watcher, err
 			select {
 			case w.events <- []*config.KeyValue{kv}:
 			default:
-				log.Println("[kratos-nacos] Config event channel is full, discarding change event.")
+				c.Logger().Warn("[kratos-nacos] Config event channel is full, discarding change event.")
 			}
 		},
 	})
