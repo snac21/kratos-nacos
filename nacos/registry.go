@@ -190,8 +190,26 @@ func (c *Client) GetService(ctx context.Context, serviceName string) ([]*registr
 		allInstances = append(allInstances, kratosInstances...)
 	}
 
+	// 如果 serviceName.http 和 serviceName.grpc 都没有查到，
+	// 回退直接使用原始 serviceName 查询（兼容其他语言的注册的服务）
 	if len(allInstances) == 0 {
-		// 如果 http 和 grpc 都没查到，记录警告但返回空列表
+		params := vo.SelectInstancesParam{
+			ServiceName: serviceName,
+			GroupName:   c.opts.GroupName,
+			Clusters:    c.opts.Clusters,
+			HealthyOnly: true,
+		}
+
+		instances, err := c.NamingClient.SelectInstances(params)
+		if err == nil && len(instances) > 0 {
+			allInstances = c.nacosInstancesToKratos(instances, serviceName)
+		} else if err != nil {
+			lastErr = err
+		}
+	}
+
+	if len(allInstances) == 0 {
+		// 如果依然没查到，记录警告但返回空列表
 		c.Logger().Warn("No healthy instances found for service", "service", serviceName)
 		// 如果有错误且没有找到任何实例，可以考虑返回错误
 		if lastErr != nil {
